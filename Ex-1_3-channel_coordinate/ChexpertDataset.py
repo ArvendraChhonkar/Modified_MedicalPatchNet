@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset
-from utilFunc import readCSV
+from utilFunc import generate_coord_grid, readCSV
 import argParser as ARG
 from torchvision.transforms import v2
 from PIL import Image
@@ -93,9 +93,10 @@ class ClassificationChexpertDataset(Dataset):
         imgPath,label = self.itemList[idx]
         img = self.getImg(imgPath)
         img = self.applyAugment(img)
-
         label = torch.tensor(label,dtype=torch.float32)
-
+        coord = generate_coord_grid(img.shape[1], img.shape[2])  # Generate coordinate grid based on image dimensions
+        img = torch.cat((img, coord), dim=0)  # Concatenate the image and coordinate grid along the channel dimension
+        label = torch.tensor(label,dtype=torch.float32)
         return img,label
 
     def getImg(self,imgPath):
