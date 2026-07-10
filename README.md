@@ -1,418 +1,131 @@
-# Experiment 4 — Patch-Consensus Filtering (1x1 / 3x3 / 5x5)
+# Modified_MedicalPatchNet
 
-**Repository:** `Modified_MedicalPatchNet`
-**Path:** `Ex-4_filers(1x1_3x3_5x5)/`
-**Base architecture:** MedicalPatchNet (patch-based, self-explainable chest X-ray classifier)
-**Backbone:** EfficientNetV2-S (ImageNet-1K pretrained, grayscale-adapted)
+**Explainable Chest X-Ray AI — classifying 14 diseases and generating self-explanatory localization heatmaps.**
+
+This repository documents a series of research experiments extending **MedicalPatchNet**, a patch-based, self-explainable deep learning architecture for chest X-ray disease classification and localization. Each experiment tests a different hypothesis about how to improve the base architecture's classification accuracy, localization quality (heatmaps), or robustness, while preserving its core explainability property: predictions are generated directly from per-patch logits, with no post-hoc saliency method (e.g. Grad-CAM) required.
+
+All experiments are built on the same backbone (EfficientNetV2-S, ImageNet-1K pretrained, grayscale-adapted) and the same dataset (CheXpert, evaluated in part against CheXlocalize segmentation masks), so results across experiments are directly comparable.
 
 ---
 
 ## Table of Contents
 
-1. [Abstract](#1-abstract)
-2. [Background: MedicalPatchNet Recap](#2-background-medicalpatchnet-recap)
-3. [Problem Statement](#3-problem-statement)
-4. [Proposed Solution: The Soft Consensus Gate](#4-proposed-solution-the-soft-consensus-gate)
-5. [Mathematical Formulation](#5-mathematical-formulation)
-6. [Repository Structure](#6-repository-structure)
-7. [Variant A — `default3x3/`](#7-variant-a--default3x3)
-8. [Variant B — `default_filter_with_miniclassifiers/`](#8-variant-b--default_filter_with_miniclassifiers)
-9. [Variant C — `implemented 3x3 filter twice/`](#9-variant-c--implemented-3x3-filter-twice)
-10. [Side-by-Side Code Diff](#10-side-by-side-code-diff)
-11. [Parameter & Complexity Analysis](#11-parameter--complexity-analysis)
-12. [Results and Discussion](#12-results-and-discussion)
-13. [Known Issues / Bugs Found in Code](#13-known-issues--bugs-found-in-code)
-14. [Ablation Recommendations](#14-ablation-recommendations)
-15. [Relationship to Other Experiments](#15-relationship-to-other-experiments)
-16. [Usage Guide](#16-usage-guide)
-17. [Future Work](#17-future-work)
-18. [Citation](#18-citation)
+1. [Project Overview](#1-project-overview)
+2. [Repository Structure](#2-repository-structure)
+3. [Base Architecture: Original_Medical_PatchNet](#3-base-architecture-original_medical_patchnet)
+4. [Common Experimental Setup](#4-common-experimental-setup)
+5. [Experiment 1 — 3-Channel Coordinate Input](#5-experiment-1--3-channel-coordinate-input)
+6. [Experiment 2 — Architectural Changes (FiLM, Coordinate-FiLM, Mini-Classifiers)](#6-experiment-2--architectural-changes-film-coordinate-film-mini-classifiers)
+7. [Experiment 3 — Spatial Prior Patch Weighting](#7-experiment-3--spatial-prior-patch-weighting)
+8. [Experiment 4 — Patch-Consensus Filtering (1x1/3x3/5x5)](#8-experiment-4--patch-consensus-filtering-1x13x35x5)
+9. [Cross-Experiment Comparison](#9-cross-experiment-comparison)
+10. [Overall Findings](#10-overall-findings)
+11. [Setup and Installation](#11-setup-and-installation)
+12. [Usage](#12-usage)
+13. [Future Work](#13-future-work)
+14. [Citation](#14-citation)
+15. [License](#15-license)
 
 ---
 
-## 1. Abstract
+## 1. Project Overview
 
-MedicalPatchNet performs chest X-ray disease classification and localization by tiling each 512x512 radiograph into an 8x8 grid of 64 non-overlapping 64x64 patches, passing every patch independently through a shared EfficientNetV2-S backbone, and averaging the resulting per-patch, 14-class disease logits to produce an image-level diagnosis. This design is what gives the model its self-explainability: the raw per-patch logits, before averaging, can be rendered directly as a heatmap without any post-hoc saliency method such as Grad-CAM.
+MedicalPatchNet classifies chest X-rays for 14 CheXpert disease labels and localizes disease regions without any separate post-hoc explainability step. It does this by:
 
-The weakness of this design is that **mean aggregation trusts every patch equally**. A single anomalous patch — for example, one containing an imaging artifact, a rib overlap, or a boundary effect — can shift the global average toward a false positive even when none of its spatial neighbors show any supporting evidence. Real pathology, by contrast, is spatially coherent: a genuine consolidation, effusion, or opacity typically spans a contiguous cluster of patches, not a single isolated cell in the 8x8 grid.
+1. Splitting each 512x512 chest X-ray into an 8x8 grid of 64 non-overlapping 64x64 patches.
+2. Running every patch independently through a **shared** EfficientNetV2-S backbone to get 14-class disease logits per patch.
+3. Averaging the 64 sets of patch logits into a single global, image-level prediction (via sigmoid).
+4. Rendering the un-averaged per-patch logits directly as an 8x8 heatmap — since each value is literally "what does the network think this specific region shows," no Grad-CAM or similar saliency method is needed.
 
-Experiment 4 addresses this by inserting a **Soft Consensus Gate** — a small, learnable, depthwise-convolutional module — between the raw per-patch logits and the final mean-aggregation step. The gate inspects each patch's local neighborhood in logit-space, separately for each of the 14 disease channels, and produces a per-patch, per-class multiplier in the range `[0, 2]`. Patches whose logits agree with their neighbors are passed through or amplified; patches that disagree with their neighborhood are suppressed toward zero, treating them as likely noise/outliers. This experiment set implements and compares **three concrete variants** of this idea, changing the classifier head and the exact gating arithmetic, and finds that the specific formulation of the gate matters more than the classifier head that precedes it.
+The problem statement motivating this whole repository: traditional CNNs are accurate but are black boxes, and bolting on explainability after the fact (Grad-CAM, Grad-CAM++) does not always produce clinically reliable results. MedicalPatchNet is explainable by construction, but its simple architecture (frozen patch size, one linear classifier, uniform-mean aggregation) leaves several open questions — does the model need spatial awareness? Can feature modulation improve it without breaking its pretrained features? Does treating all patches equally hurt performance? Experiments 1 through 4 in this repository investigate exactly these questions, one variable at a time.
 
 ---
 
-## 2. Background: MedicalPatchNet Recap
-
-For context, the original, unmodified pipeline (`ScalePatchNet`) that all three Experiment-4 variants build on top of is:
+## 2. Repository Structure
 
 ```
-Input (1, 512, 512) grayscale chest X-ray
-        │
-        ▼
-Unfold into 8x8 grid of 64 patches, each (1, 64, 64)
-        │
-        ▼
-Reshape to (B*64, 1, 64, 64)  — patches placed in the batch dimension
-        │
-        ▼
-Shared EfficientNetV2-S backbone (grayscale first conv, ImageNet-pretrained)
-        │
-        ▼
-Linear(1280 -> 14)  classifier head
-        │
-        ▼
-Reshape back to (B, 64, 14)   — per-patch, per-disease logits
-        │
-        ▼
-Mean over the 64-patch dimension  →  (B, 14) global disease logits
-        │
-        ▼
-Sigmoid  →  final probabilities for 14 CheXpert disease classes
-```
-
-Because the per-patch logits are meaningful on their own (each one is literally "what does this backbone think this specific 64x64 region shows"), they can be reshaped into an 8x8 grid and visualized directly as a heatmap — this is the basis of MedicalPatchNet's built-in explainability.
-
----
-
-## 3. Problem Statement
-
-Given raw per-patch logits `patch_logits` of shape `(B, 64, 14)`:
-
-```python
-global_logits = torch.mean(patch_logits, dim=1)   # (B, 14)
-```
-
-This treats the 64 patches as i.i.d. samples and simply averages them. There is no mechanism by which the network can decide "this particular patch's high logit is not corroborated by anything nearby, so I should not fully trust it." The guide's suggestion was to introduce exactly this mechanism: **a convolution over the spatial grid of logits that compares each patch to its neighbors, and gates (attenuates or boosts) the patch's contribution based on that local agreement** — effectively a learned, soft, per-disease "outlier rejection" filter applied before aggregation.
-
----
-
-## 4. Proposed Solution: The Soft Consensus Gate
-
-The Soft Consensus Gate is a tiny convolutional sub-network — three layers, applied not to pixels but to the 8x8 grid of already-computed disease logits:
-
-1. **Depthwise spatial convolution** — `Conv2d(14, 14, kernel_size=k, padding=(k-1)//2, groups=14)`. Because `groups=14` equals the channel count, this is a fully depthwise convolution: each of the 14 disease channels gets its own independent `k x k` spatial filter, and channels never mix at this stage. This is the layer that actually implements "compare a patch to its neighbors," separately for every disease.
-2. **Pointwise convolution** — `Conv2d(14, 14, kernel_size=1)`. A 1x1 convolution across the 14-channel dimension at each spatial location, giving the network a chance to linearly recombine/recalibrate the 14 per-disease agreement scores before the nonlinearity.
-3. **Sigmoid activation** — bounds every output to `(0, 1)`.
-4. **Rescale by 2** — multiplying the sigmoid output by 2 stretches the effective gate range to `(0, 2)`, so the gate can act as either a suppressor (value < 1, dampening the patch) or a booster (value > 1, amplifying the patch) rather than being restricted to pure attenuation.
-
-The gate is computed once per forward pass, at the same spatial resolution as the patch grid (8x8), and multiplies element-wise into the patch logits **before** the mean-aggregation step. Because the gate depends only on the logits already produced by the backbone (not on raw pixels or intermediate feature maps), it is extremely cheap: it adds only `14 * k * k` depthwise weights plus `14 * 14` pointwise weights to the entire network, a negligible number of parameters compared to EfficientNetV2-S's ~20 million.
-
----
-
-## 5. Mathematical Formulation
-
-Let \( L \in \mathbb{R}^{B \times 8 \times 8 \times 14} \) denote the reshaped raw patch logits for disease channel \( c \) at grid position \( (i, j) \).
-
-**Depthwise convolution** (per-channel, independent filters \( W_c \in \mathbb{R}^{k \times k} \)):
-
-\[ D_c(i,j) = \sum_{u=-\lfloor k/2 \rfloor}^{\lfloor k/2 \rfloor} \sum_{v=-\lfloor k/2 \rfloor}^{\lfloor k/2 \rfloor} W_c(u,v) \cdot L_c(i+u, j+v) \]
-
-**Pointwise mixing** (linear recombination across the 14 channels, weights \( M \in \mathbb{R}^{14 \times 14} \)):
-
-\[ P_c(i,j) = \sum_{c'=1}^{14} M_{c,c'} \cdot D_{c'}(i,j) + b_c \]
-
-**Gate activation:**
-
-\[ G_c(i,j) = 2 \cdot \sigma\big(P_c(i,j)\big), \qquad G_c(i,j) \in (0, 2) \]
-
-**Gated logits (multiplicative form, Variants A and B):**
-
-\[ \hat{L}_c(i,j) = L_c(i,j) \cdot G_c(i,j) \]
-
-**Gated logits (residual form, Variant C):**
-
-\[ \hat{L}_c(i,j) = L_c(i,j) \cdot \big(1 + G_c(i,j)\big) \]
-
-**Global aggregation** (identical across all variants):
-
-\[ \text{GlobalLogit}_c = \frac{1}{64} \sum_{i=1}^{8} \sum_{j=1}^{8} \hat{L}_c(i,j), \qquad \hat{P}_c = \sigma(\text{GlobalLogit}_c) [1] \)
-
-Equation [1] gives the final sigmoid disease probability for class \( c \).
-
----
-
-## 6. Repository Structure
-
-```
-Ex-4_filers(1x1_3x3_5x5)/
+Modified_MedicalPatchNet/
 │
-├── default3x3/
+├── Original_Medical_PatchNet/              # Baseline: unmodified MedicalPatchNet
+│   ├── NetworkModel.py                     # ScalePatchNet (base architecture)
+│   ├── ChexpertDataset.py                  # CheXpert dataset loader
+│   ├── trainClassification.py              # Training script
+│   ├── evalClassification.py               # Evaluation script
+│   ├── tune_heatmap_threshold_opt.py        # Heatmap threshold tuning
+│   ├── figureGeneration.py                 # Figure/plot generation
+│   ├── imgRetrivalUtil.py                  # Image retrieval utilities
+│   ├── utilFunc.py                         # Shared utility functions
+│   ├── argParser.py                        # CLI argument parsing
+│   ├── environment.yml                     # Conda environment spec
+│   ├── runTraining.sh / runEval.sh          # Shell scripts for training/eval
+│   ├── preprocessing/                      # Dataset preprocessing scripts
+│   └── savedModels/                        # Pretrained/trained checkpoints
+│
+├── Ex-1_3-channel_coordinate/              # Experiment 1: coordinate channel concatenation
+│   ├── NetworkModel.py
+│   ├── ChexpertDataset.py
+│   ├── trainClassification.py
+│   ├── evalClassification.py
+│   ├── utilFunc.py
+│   └── argParser.py
+│
+├── Ex-2_Architectural Changes/             # Experiment 2: FiLM / coordinate-FiLM / mini-classifiers
 │   └── NetworkModel.py
-│       └── class ScalePatchNet_filter
-│           - Backbone: EfficientNetV2-S, grayscale input
-│           - Classifier: nn.Linear(1280, 14)          (single linear layer, unchanged from base)
-│           - Gate: kernel_size = 3, multiplicative     gated = logits * gate
 │
-├── default_filter_with_miniclassifiers/
-│   └── NetworkModel.py
-│       └── class ScalePatchNet_filter   (same class name, different classifier head)
-│           - Backbone: EfficientNetV2-S, grayscale input
-│           - Classifier: Dropout(0.2) -> Linear(1280,512) -> ReLU
-│                          -> Linear(512,256) -> ReLU -> Linear(256,14)
-│           - Gate: kernel_size = 3, multiplicative     gated = logits * gate
+├── Ex-3_moreWeight_to_central_region/      # Experiment 3: inference-time spatial-prior weighting
+│   ├── NetworlModel.py
+│   ├── patchWeighting.py
+│   ├── evalClassification.py
+│   └── figureGeneration.py
 │
-└── implemented 3x3 filter twice - really high perecision f1 specificity and senesitivity/
-    └── NetworkModel.py
-        └── class ScalePatchNet_1x1
-            - Backbone: EfficientNetV2-S, grayscale input
-            - Classifier: nn.Linear(1280, 14)           (single linear layer)
-            - Gate: kernel_size = 3, computed TWICE, residual   gated = logits * (1 + gate)
+├── Ex-4_filers(1x1_3x3_5x5)/                # Experiment 4: learned patch-consensus gating
+│   ├── default3x3/
+│   │   └── NetworkModel.py
+│   ├── default_filter_with_miniclassifiers/
+│   │   └── NetworkModel.py
+│   └── implemented 3x3 filter twice - really high perecision f1 specificity and senesitivity/
+│       └── NetworkModel.py
+│
+├── LICENSE                                 # MIT License
+└── README.md                               # This file
 ```
 
 ---
 
-## 7. Variant A — `default3x3/`
+## 3. Base Architecture: `Original_Medical_PatchNet`
 
-**Class name:** `ScalePatchNet_filter`
-**Role in this study:** the reference / control configuration — original linear classifier, single consensus gate pass, standard multiplicative gating.
+This folder holds the unmodified reference implementation that every experiment branches from.
 
-### 7.1 Full Source
+### 3.1 Pipeline
 
-```python
-from PIL.ImageFilter import Kernel
-import torchvision
-import torch.nn as nn
-import torch
-import torch.nn.functional as F
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ScalePatchNet — original model, kept verbatim
-# ─────────────────────────────────────────────────────────────────────────────
-
-# adding - 3x3 or any other size filter
-class ScalePatchNet_filter(nn.Module):
-    def __init__(self, patchSize, outFeatures=14) -> None:
-        super(ScalePatchNet_filter, self).__init__()
-        self.baseBackbone = torchvision.models.efficientnet_v2_s(
-            weights=torchvision.models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
-        )
-        self.baseBackbone.features[0][0] = nn.Conv2d(
-            1, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False
-        )
-        self.baseBackbone.classifier[1] = nn.Linear(
-            in_features=1280, out_features=outFeatures, bias=True
-        )
-        self.patchSize = patchSize
-
-        # ==============================
-        # Soft Consensus Gate
-        # ==============================
-        kernel_size = 3  # change this to change the filter size (now it is 3x3)
-        # you can set 1x1 or 5x5 or any other size filter
-        self.consensus_conv = nn.Sequential(
-            nn.Conv2d(
-                in_channels=14,
-                out_channels=14,
-                kernel_size=kernel_size,
-                padding=(kernel_size - 1) // 2,
-                groups=14
-            ),
-            nn.Conv2d(
-                in_channels=14,
-                out_channels=14,
-                kernel_size=1
-            ),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        patch_logits = self.forwardRawPatches(x)
-        patch_logits = self.applyConsensusGate(patch_logits)
-        global_logits = torch.mean(patch_logits, dim=1)
-        return global_logits
-
-    def applyConsensusGate(self, patch_logits):
-        B = patch_logits.size(0)
-        C = patch_logits.size(2)
-        grid = int(patch_logits.size(1) ** 0.5)
-        assert grid * grid == patch_logits.size(1)
-
-        # (B,64,14) -> (B,14,8,8)
-        gate_input = patch_logits.view(B, grid, grid, C).permute(0, 3, 1, 2)
-
-        gate = self.consensus_conv(gate_input)
-        gate = 2 * gate
-        gate = gate.permute(0, 2, 3, 1).reshape(B, grid * grid, C)
-
-        gated_logits = patch_logits * gate
-        return gated_logits
-
-    def forwardRawPatches(self, x):
-        batchSize = x.size()[0]
-        x = x.unfold(2, self.patchSize, self.patchSize).unfold(3, self.patchSize, self.patchSize)
-        x = x.permute(0, 2, 3, 1, 4, 5).reshape(-1, 1, self.patchSize, self.patchSize)
-        x = self.baseBackbone(x)
-        assert x.size()[0] % batchSize == 0
-        patchCount = int(x.size()[0] / batchSize)
-        batchList = torch.split(x, patchCount)
-        x = torch.stack(batchList)
-        return x
-
-    def forwardScaledPatches(self, x):
-        rawPatchLogits = self.forwardRawPatches(x)
-        rawPatchLogits = self.applyConsensusGate(rawPatchLogits)
-        globalLogits = torch.mean(rawPatchLogits, dim=1)
-        globalProb = torch.sigmoid(globalLogits)
-        scaled = rawPatchLogits * globalProb.unsqueeze(1)
-        return scaled
-
-
-MODEL_CLASS_LIST = [   # To make it easy to add other models
-    ScalePatchNet_filter,
-]
-
-def getModelClass(modelClassName):
-    for ModelClass in MODEL_CLASS_LIST:
-        if ModelClass.__name__ == modelClassName:
-            return ModelClass
-    assert False, modelClassName + " not in " + str([x.__name__ for x in MODEL_CLASS_LIST])
+```
+Input ChestX-ray (1, 512, 512) grayscale
+        │
+        ▼
+Unfold into 8x8 grid → 64 patches, each (1, 64, 64)
+        │
+        ▼
+Shared EfficientNetV2-S backbone (grayscale-adapted first conv layer)
+        │
+        ▼
+Linear(1280 → 14) classifier head
+        │
+        ▼
+Reshape → (B, 64, 14) per-patch, per-disease logits
+        │
+        ▼
+Mean over 64 patches → (B, 14) global logits
+        │
+        ▼
+Sigmoid → 14 disease probabilities
 ```
 
-### 7.2 Walkthrough
-
-- The backbone and classifier are **identical** to the original `ScalePatchNet` — grayscale-adapted EfficientNetV2-S with `classifier[1]` replaced by a single `Linear(1280, 14)`.
-- The only addition is `self.consensus_conv` and the `applyConsensusGate` method, inserted between `forwardRawPatches` and the mean-aggregation in `forward`.
-- `kernel_size` is exposed as a plain local variable inside `__init__`, so changing it to `1` or `5` (hence the folder name "1x1_3x3_5x5") is a one-line edit — this file specifically uses `kernel_size = 3`.
-- `forwardScaledPatches` also runs the consensus gate before computing the sigmoid-scaled heatmap output, so visualizations reflect the same gating used at training/inference time.
-
----
-
-## 8. Variant B — `default_filter_with_miniclassifiers/`
-
-**Class name:** `ScalePatchNet_filter` (same name as Variant A, but a different classifier head — the two files are not meant to be imported together)
-**Role in this study:** tests whether a deeper, non-linear classifier head improves the quality of the logits the consensus gate has to work with.
-
-### 8.1 Full Source
+### 3.2 Core Model Code (`ScalePatchNet`)
 
 ```python
-from PIL.ImageFilter import Kernel
-import torchvision
-import torch.nn as nn
-import torch
-import torch.nn.functional as F
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ScalePatchNet — original model, kept verbatim
-# ─────────────────────────────────────────────────────────────────────────────
-
-# adding - 3x3 or any other size filter
-class ScalePatchNet_filter(nn.Module):
-    def __init__(self, patchSize, outFeatures=14) -> None:
-        super(ScalePatchNet_filter, self).__init__()
-        self.baseBackbone = torchvision.models.efficientnet_v2_s(
-            weights=torchvision.models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
-        )
-        self.baseBackbone.features[0][0] = nn.Conv2d(
-            1, 24, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False
-        )
-
-        # Lightweight multi-layer classifier: 1280 -> 512 -> 256 -> 14
-        self.baseBackbone.classifier = nn.Sequential(
-            nn.Dropout(p=0.2),          # optional but recommended
-            nn.Linear(1280, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, outFeatures)
-        )
-        self.patchSize = patchSize
-
-        # ==============================
-        # Soft Consensus Gate
-        # ==============================
-        kernel_size = 3  # change this to change the filter size (now it is 3x3)
-        # you can set 1x1 or 5x5 or any other size filter
-        self.consensus_conv = nn.Sequential(
-            nn.Conv2d(
-                in_channels=14,
-                out_channels=14,
-                kernel_size=kernel_size,
-                padding=(kernel_size - 1) // 2,
-                groups=14
-            ),
-            nn.Conv2d(
-                in_channels=14,
-                out_channels=14,
-                kernel_size=1
-            ),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        patch_logits = self.forwardRawPatches(x)
-        patch_logits = self.applyConsensusGate(patch_logits)
-        global_logits = torch.mean(patch_logits, dim=1)
-        return global_logits
-
-    def applyConsensusGate(self, patch_logits):
-        B = patch_logits.size(0)
-        C = patch_logits.size(2)
-        grid = int(patch_logits.size(1) ** 0.5)
-        assert grid * grid == patch_logits.size(1)
-
-        gate_input = patch_logits.view(B, grid, grid, C).permute(0, 3, 1, 2)
-        gate = self.consensus_conv(gate_input)
-        gate = 2 * gate
-        gate = gate.permute(0, 2, 3, 1).reshape(B, grid * grid, C)
-
-        gated_logits = patch_logits * gate
-        return gated_logits
-
-    def forwardRawPatches(self, x):
-        batchSize = x.size()[0]
-        x = x.unfold(2, self.patchSize, self.patchSize).unfold(3, self.patchSize, self.patchSize)
-        x = x.permute(0, 2, 3, 1, 4, 5).reshape(-1, 1, self.patchSize, self.patchSize)
-        x = self.baseBackbone(x)
-        assert x.size()[0] % batchSize == 0
-        patchCount = int(x.size()[0] / batchSize)
-        batchList = torch.split(x, patchCount)
-        x = torch.stack(batchList)
-        return x
-
-    def forwardScaledPatches(self, x):
-        rawPatchLogits = self.forwardRawPatches(x)
-        rawPatchLogits = self.applyConsensusGate(rawPatchLogits)
-        globalLogits = torch.mean(rawPatchLogits, dim=1)
-        globalProb = torch.sigmoid(globalLogits)
-        scaled = rawPatchLogits * globalProb.unsqueeze(1)
-        return scaled
-
-
-MODEL_CLASS_LIST = [   # To make it easy to add other models
-    ScalePatchNet_filter,
-]
-
-def getModelClass(modelClassName):
-    for ModelClass in MODEL_CLASS_LIST:
-        if ModelClass.__name__ == modelClassName:
-            return ModelClass
-    assert False, modelClassName + " not in " + str([x.__name__ for x in MODEL_CLASS_LIST])
-```
-
-### 8.2 Walkthrough
-
-- The **only** structural difference from Variant A is `self.baseBackbone.classifier`, which is replaced wholesale (not just index `[1]`) with a 3-linear-layer MLP: `Dropout(0.2) -> Linear(1280,512) -> ReLU -> Linear(512,256) -> ReLU -> Linear(256,14)`.
-- The consensus gate is byte-for-byte identical to Variant A — same `kernel_size = 3`, same multiplicative gating (`patch_logits * gate`).
-- This isolates one variable: does giving the classifier more capacity/non-linearity, upstream of an unchanged gate, produce better-gated final predictions?
-- **Empirically, this combination underperformed Variant A** — see Section 12.
-
----
-
-## 9. Variant C — `implemented 3x3 filter twice - really high perecision f1 specificity and senesitivity/`
-
-**Class name:** `ScalePatchNet_1x1` (name is legacy/inherited from an earlier 1x1-kernel version of the file; the kernel actually used is 3x3, as set by `kernel_size = 3` inside `__init__`)
-**Role in this study:** the best-performing variant in this experiment set, distinguished by residual (rather than pure multiplicative) gating and a duplicated gate computation.
-
-### 9.1 Full Source
-
-```python
-import torchvision
-import torch.nn as nn
-import torch
-
-
-class ScalePatchNet_1x1(nn.Module):
+class ScalePatchNet(nn.Module):
     def __init__(self, patchSize, outFeatures=512) -> None:
-        super(ScalePatchNet_1x1, self).__init__()
+        super(ScalePatchNet, self).__init__()
         self.baseBackbone = torchvision.models.efficientnet_v2_s(
             weights=torchvision.models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
         )
@@ -424,53 +137,17 @@ class ScalePatchNet_1x1(nn.Module):
         )
         self.patchSize = patchSize
 
-        # ==============================
-        # Soft Consensus Gate
-        # ==============================
-        kernel_size = 3
-        self.consensus_conv = nn.Sequential(
-            nn.Conv2d(
-                in_channels=14,
-                out_channels=14,
-                kernel_size=kernel_size,
-                padding=(kernel_size - 1) // 2,
-                groups=14
-            ),
-            nn.Conv2d(
-                in_channels=14,
-                out_channels=14,
-                kernel_size=1
-            ),
-            nn.Sigmoid()
-        )
-
-    def applyConsensusGate(self, patch_logits):
-        B = patch_logits.size(0)
-        C = patch_logits.size(2)
-        grid = int(patch_logits.size(1) ** 0.5)
-        assert grid * grid == patch_logits.size(1)
-
-        gate_input = patch_logits.view(B, grid, grid, C).permute(0, 3, 1, 2)
-
-        gate = self.consensus_conv(gate_input)               # 1st pass (result discarded below)
-        gate = gate.permute(0, 2, 3, 1).reshape(B, grid * grid, C)
-
-        gate = 2 * self.consensus_conv(gate_input)            # 2nd pass — this is the one actually used
-        gated_logits = patch_logits * (1 + gate)
-        return gated_logits
-
     def forward(self, x):
-        patch_logits = self.forwardRawPatches(x)
-        patch_logits = self.applyConsensusGate(patch_logits)
-        global_logits = torch.mean(patch_logits, dim=1)
-        return global_logits
+        x = self.forwardRawPatches(x)
+        x = torch.mean(x, dim=1)
+        return x
 
-    def forwardRawPatches(self, x):  # forward raw patches
-        batchSize = x.size()[0]     # put patches in batch dimension
+    def forwardRawPatches(self, x):
+        batchSize = x.size()[0]
         x = x.unfold(2, self.patchSize, self.patchSize).unfold(3, self.patchSize, self.patchSize)
         x = x.permute(0, 2, 3, 1, 4, 5).reshape(-1, 1, self.patchSize, self.patchSize)
         x = self.baseBackbone(x)
-        assert x.size()[0] % batchSize == 0   # recreate image batches
+        assert x.size()[0] % batchSize == 0
         patchCount = int(x.size()[0] / batchSize)
         batchList = torch.split(x, patchCount)
         x = torch.stack(batchList)
@@ -478,197 +155,475 @@ class ScalePatchNet_1x1(nn.Module):
 
     def forwardScaledPatches(self, x):
         rawPatchLogits = self.forwardRawPatches(x)
-        rawPatchLogits = self.applyConsensusGate(rawPatchLogits)
         globalLogits = torch.mean(rawPatchLogits, dim=1)
         globalProb = torch.sigmoid(globalLogits)
-        scaled = rawPatchLogits * globalProb.unsqueeze(1)
-        # NOTE: this function is missing a `return scaled` statement in the
-        # original source — see Section 13, "Known Issues".
-
-
-MODEL_CLASS_LIST = [   # To make it easy to add other models
-    ScalePatchNet_1x1,
-]
-
-def getModelClass(modelClassName):
-    for ModelClass in MODEL_CLASS_LIST:
-        if ModelClass.__name__ == modelClassName:
-            return ModelClass
-    assert False, modelClassName + "not in" + str([x.__name__ for x in MODEL_CLASS_LIST])
+        globalProb = globalProb.unsqueeze(1).unsqueeze(2)
+        return rawPatchLogits * globalProb
 ```
 
-### 9.2 Walkthrough
+### 3.3 Datasets
 
-This is the variant referenced in the folder name as producing "really high precision, F1, specificity and sensitivity." Two things distinguish it from Variants A/B:
-
-1. **The gate is computed twice.** `self.consensus_conv(gate_input)` is called once and reshaped (into a `(B, 64, 14)` tensor) but this first result is never used — it is immediately overwritten by a second, independent call `gate = 2 * self.consensus_conv(gate_input)`. Because `consensus_conv` contains no dropout or other stochastic layers, the two calls are numerically identical in a given forward pass; the first call is dead code, but the naming "filter twice" in the folder reflects that the convolution module is literally invoked twice in the source, and this repeated-invocation pattern is what the guide's "3x3 filter twice" idea refers to in the experiment log.
-2. **The gating arithmetic is residual, not multiplicative.** Instead of `patch_logits * gate` (Variants A/B), this variant computes `patch_logits * (1 + gate)`. With `gate` bounded to `(0, 2)` by the `2 * sigmoid(...)` rescale, the multiplier `(1 + gate)` is bounded to `(1, 3)` — meaning this formulation can only ever **preserve or amplify** a patch's logit, never suppress it below its original value. This is a meaningfully different inductive bias from Variants A/B, where the multiplier is bounded to `(0, 2)` and can suppress a patch down toward zero.
-
----
-
-## 10. Side-by-Side Code Diff
-
-| Aspect | Variant A (`default3x3`) | Variant B (`...miniclassifiers`) | Variant C (`...filter twice`) |
-|---|---|---|---|
-| Class name | `ScalePatchNet_filter` | `ScalePatchNet_filter` | `ScalePatchNet_1x1` |
-| Classifier head | `nn.Linear(1280, 14)` | `Dropout -> Linear(1280,512) -> ReLU -> Linear(512,256) -> ReLU -> Linear(256,14)` | `nn.Linear(1280, outFeatures)` (default `outFeatures=512`, must be set to 14 for CheXpert) |
-| Gate kernel size | 3x3, depthwise (`groups=14`) | 3x3, depthwise (`groups=14`) | 3x3, depthwise (`groups=14`) |
-| Gate calls per forward | 1 | 1 | 2 (first result discarded) |
-| Gate output range | `(0, 2)` | `(0, 2)` | `(0, 2)` |
-| Gating formula | `logits * gate` | `logits * gate` | `logits * (1 + gate)` |
-| Effective multiplier range | `(0, 2)` — can zero out a patch | `(0, 2)` — can zero out a patch | `(1, 3)` — can only preserve/boost a patch |
-| Applied in `forwardScaledPatches` | Yes | Yes | Yes, but missing `return` (bug) |
-| Reported outcome | Good, stable metrics | Weaker than Variant A | **Best** — high precision, F1, sensitivity, specificity |
-
----
-
-## 11. Parameter & Complexity Analysis
-
-The Soft Consensus Gate is deliberately lightweight relative to the EfficientNetV2-S backbone (~20.2M parameters, ~21M with the grayscale first-layer modification):
-
-| Component | Parameter Count (kernel_size = 3) |
+| Dataset | Role |
 |---|---|
-| Depthwise conv: `Conv2d(14, 14, 3, groups=14)` | \( 14 \times 1 \times 3 \times 3 + 14 = 140 \) |
-| Pointwise conv: `Conv2d(14, 14, 1)` | \( 14 \times 14 \times 1 \times 1 + 14 = 210 \) |
-| **Total gate parameters** | **350** |
-| EfficientNetV2-S backbone (approx.) | ~20,200,000 |
-| Linear classifier `1280 -> 14` | \( 1280 \times 14 + 14 = 17{,}934 \) |
-| Mini-classifier `1280->512->256->14` (Variant B) | \( (1280 \times 512 + 512) + (512 \times 256 + 256) + (256 \times 14 + 14) \approx 787{,}598 \) |
+| **CheXpert** | >223,000 chest X-rays from >65,000 patients, 14 disease labels, multi-label classification. Used for training and classification evaluation. |
+| **CheXlocalize** | Extends CheXpert with expert-annotated segmentation masks for several diseases, enabling quantitative localization metrics (IoU, Dice, Hit Rate). |
 
-The consensus gate itself adds **well under 0.002%** of the backbone's parameter count regardless of kernel size (1x1, 3x3, or 5x5), making it one of the cheapest architectural interventions tested across all experiments in this repository — the entire benefit or harm it produces comes from *where* it's placed and *how* its output is combined with the logits, not from added capacity.
+### 3.4 Utilities in This Folder
+
+- `preprocessing/` — scripts to convert raw CheXpert/CheXlocalize downloads into the tensors used by `ChexpertDataset.py`.
+- `tune_heatmap_threshold_opt.py` — tunes the probability threshold used to binarize heatmaps for IoU/Dice computation.
+- `imgRetrivalUtil.py` — utilities for retrieving and matching images/annotations across datasets.
+- `runTraining.sh` / `runEval.sh` — shell wrappers around `trainClassification.py` and `evalClassification.py` for repeatable command-line runs.
+- `environment.yml` — the Conda environment definition (Python, PyTorch, Torchvision, NumPy, OpenCV) used across all experiments.
 
 ---
 
-## 12. Results and Discussion
+## 4. Common Experimental Setup
 
-The report accompanying these experiments (patient-batch training on ~29,000 CheXpert images, 20 epochs, AdamW, LR 1e-4, evaluated with AUROC / F1 / Sensitivity / Specificity / Dice / mIoU) frames the outcome of Experiment 4 qualitatively as follows:
+To keep comparisons fair, most experiments share this training configuration:
 
-| Variant | Classifier Head | Gate Formula | Reported Result |
+| Setting | Value |
+|---|---|
+| Dataset | CheXpert |
+| Training subset | ~29,000 images, patients 30,001–40,000 |
+| Input image size | 512x512 |
+| Patch size | 64x64 (→ 8x8 grid, 64 patches) |
+| Backbone | EfficientNetV2-S (ImageNet-1K pretrained) |
+| Disease classes | 14 |
+| Optimizer | AdamW |
+| Initial learning rate | 1e-4 |
+| Epochs | 20 |
+| Loss function | Binary Cross-Entropy (BCE) |
+| Evaluation metrics | AUROC, F1-score, Sensitivity, Specificity, Dice Score, Mean IoU |
+| Hardware | L4 and RTX 2050 GPUs, CUDA |
+| Software | Python, PyTorch, Torchvision, NumPy, OpenCV |
+
+Fixing the patient subset and training protocol across experiments means that any measured performance differences can be attributed to the architectural or algorithmic change under test, not to data variation.
+
+---
+
+## 5. Experiment 1 — 3-Channel Coordinate Input
+
+**Folder:** `Ex-1_3-channel_coordinate/`
+
+### 5.1 Objective
+
+Tests whether giving the network explicit knowledge of *where* in the radiograph a patch is located — via raw coordinate channels — improves classification and localization.
+
+### 5.2 Method
+
+Each 64x64 grayscale patch is extended from 1 channel to 3 channels:
+
+| Channel | Content |
+|---|---|
+| 0 | Original grayscale X-ray intensities |
+| 1 | Normalized horizontal (x) coordinate map |
+| 2 | Normalized vertical (y) coordinate map |
+
+The modified backbone's first convolution accepts 3 input channels instead of 1, and training proceeds with the pretrained weights from the original paper as a starting point, with the backbone initially frozen. Because two of the three input channels are coordinate grids rather than pixel intensities, saliency methods like Grad-CAM and Grad-CAM++ become unreliable (they assume all channels carry visual content), so **localization was evaluated with IoU metrics rather than saliency maps.**
+
+### 5.3 Progressive (Batched) Training Strategy
+
+Because CheXpert is large, training was split into successive batches of ~10,000 patients each, and the model was evaluated after each stage:
+
+- Batch 1: patients 1–10,000
+- Batch 2: patients 10,001–20,000
+- Batch 3: patients 20,001–30,000
+- Batch 4: patients 30,001–40,000
+
+### 5.4 Training Dynamics (Batch 1, across epochs)
+
+| Metric | Epoch 1 | Epoch 6 | Epoch 12 |
 |---|---|---|---|
-| A — `default3x3` | Single linear layer | `logits * gate`, one pass | Good metrics, stable and predictable behavior |
-| B — `...miniclassifiers` | 3-layer MLP head | `logits * gate`, one pass | Weaker metrics than Variant A |
-| C — `...filter twice` | Single linear layer | `logits * (1 + gate)`, two passes | **High precision, F1, sensitivity, and specificity** — best of the three |
+| Macro AUROC | 0.571 | 0.616 | 0.564 |
+| Macro F1 | 0.242 | 0.290 | 0.266 |
+| Average Sensitivity | 0.144 | 0.146 | 0.152 |
+| Average Specificity | 0.931 | 0.927 | 0.925 |
 
-### 12.1 Why might Variant B underperform?
+Macro AUROC peaked at Epoch 6; training beyond that point hurt both AUROC and F1, indicating overfitting. The sharpest class-wise degradation was in **No Finding**, which fell from 0.680 (Epoch 6) to 0.473 (Epoch 12) — evidence the model drifted toward over-predicting disease as training continued. Other notable drops: Atelectasis (−0.148), Lung Opacity (−0.123), Pleural Effusion (−0.086).
 
-The mini-classifier adds two extra fully-connected layers (~788K new parameters) between the pretrained EfficientNetV2-S features and the final 14-way output. Since the backbone in this experiment set is being fine-tuned on a comparatively small subset (~29K images) for a modest number of epochs, a deeper, freshly-initialized head has more parameters to learn from the same signal, increasing the risk of underfitting or noisy logits — which then propagate into a *consensus gate that has no way to distinguish "genuinely disagreeing neighbor" from "under-trained, noisy neighbor."* A gate built on top of noisier upstream logits has less reliable spatial agreement to exploit.
+### 5.5 Classification and Localization Results
 
-### 12.2 Why might Variant C outperform?
+**Patients 1–10,000 (Baseline vs. Coordinate-aware model):**
 
-The residual formulation `logits * (1 + gate)` guarantees `gate=0` reduces to an identity mapping (no change to the original logit), whereas the multiplicative formulation `logits * gate` requires the gate to sit exactly at `gate=1` to preserve the logit unchanged, and can drive it toward `0` for any lower gate value. In early training, when the consensus_conv weights are close to their initialization, the residual form is much closer to acting as a safe identity/near-identity operation and only gradually learns to add a corrective boost, whereas the multiplicative form is starting from a much more aggressive, potentially destabilizing rescale. This is analogous to why residual connections (ResNets) are generally easier to optimize than plain feedforward stacks — the network only has to learn a *correction* on top of a working baseline, not a scale factor from scratch.
+| Metric | Baseline | Coordinate Model |
+|---|---|---|
+| Accuracy | 0.816 | 0.386 |
+| Precision | 0.865 | 0.379 |
+| Recall | 0.825 | 0.021 |
+| F1 Score | 0.844 | 0.039 |
+| Mean IoU | 0.069 | 0.021 |
 
----
+**Patients 10,001–20,000:** Recall fell sharply across most diseases (e.g., Airspace Opacity F1 0.890 → 0.280; Atelectasis F1 0.821 → 0.055; Cardiomegaly F1 0.736 → 0.194; Enlarged Cardiomediastinum and Consolidation recall dropped to zero). A few localization scores improved slightly (Lung Lesion +0.12 IoU, Support Devices +0.03 IoU, Pneumothorax +0.05 IoU), but overall positive-case mean IoU stayed essentially flat (Baseline 0.1067 vs. Proposed 0.1020).
 
-## 13. Known Issues / Bugs Found in Code
+**Patients 20,001–30,000 and 30,001–40,000 (progressive training):**
 
-For engineering transparency, the following issues exist in the current source files and should be fixed before this code is used for further production training or published benchmarking:
-
-1. **Variant C — missing return statement.** `forwardScaledPatches` in `ScalePatchNet_1x1` computes `scaled` but never returns it, so calling this method currently returns `None`. This does not affect `forward()` or training, but breaks heatmap/visualization code that relies on `forwardScaledPatches`.
-2. **Variant C — redundant first gate computation.** In `applyConsensusGate`, the first call to `self.consensus_conv(gate_input)` (assigned to `gate`, reshaped, then immediately overwritten) has no effect on the output and only wastes compute. It can be safely deleted; the folder's "twice" naming reflects this literal double invocation in the source rather than an intentional ensembling effect.
-3. **Variant C — `outFeatures` default is 512, not 14.** The constructor signature `def __init__(self, patchSize, outFeatures=512)` mirrors the original `ScalePatchNet`'s default, but for a 14-class CheXpert task this must be explicitly passed as `outFeatures=14` at instantiation time, or the consensus gate (hardcoded for 14 channels) will shape-mismatch against the classifier output.
-4. **Variants A/B share a class name.** Both `default3x3/NetworkModel.py` and `default_filter_with_miniclassifiers/NetworkModel.py` define a class called `ScalePatchNet_filter`. They are not designed to be imported into the same namespace simultaneously — keep them in separate modules/folders as currently structured, or rename one class if you plan to import both into a single training script.
-5. **Unused imports.** `from PIL.ImageFilter import Kernel` and `import torch.nn.functional as F` are present in Variants A and B but unused in the code shown — safe to remove.
-
----
-
-## 14. Ablation Recommendations
-
-To turn this into a rigorous, publication-ready ablation table, the following controlled experiments are recommended as immediate next steps:
-
-1. **Isolate kernel size.** Fix the classifier (linear head) and the gating formula (multiplicative), and sweep `kernel_size in {1, 3, 5}` to measure the effect of neighborhood radius alone, independent of the arithmetic change found in Variant C.
-2. **Isolate gating arithmetic.** Fix kernel size at 3x3 and the linear classifier, and directly compare `logits * gate` vs. `logits * (1 + gate)` with the redundant first convolution call removed, to confirm the residual formulation is the true source of Variant C's improvement (rather than the duplicated computation itself, e.g. via numerical effects if dropout/batchnorm were ever added to `consensus_conv`).
-3. **Fix the identified bugs** (Section 13) before rerunning any comparison, particularly the missing `return` in `forwardScaledPatches`, so that heatmap-based qualitative evaluation is possible for all three variants.
-4. **Report the full metric suite per variant** — AUROC, F1, Sensitivity, Specificity, Dice, and mIoU, per-disease as well as macro-averaged — using the same held-out patient split (e.g., patients 30,001-40,000 from CheXpert, as used elsewhere in this repository) so results are directly comparable to the FiLM and coordinate-conditioning experiments.
-5. **Visualize the learned gate itself.** Since `consensus_conv` output is only 8x8x14 per image, it is cheap to log and visualize which patches get suppressed vs. boosted across a batch of validation images, to sanity-check that the gate is doing something clinically sensible (e.g., not systematically suppressing peripheral patches for diseases known to occur at the lung periphery).
-
----
-
-## 15. Relationship to Other Experiments
-
-This experiment sits at the end of a progression of spatial-awareness techniques applied to MedicalPatchNet across this repository:
-
-| Stage | Approach | Trained end-to-end? | Where in repo |
+| Metric | Baseline | After 30k patients | After 40k patients |
 |---|---|---|---|
-| 1 | Raw coordinate channel concatenation (x, y grids as extra input channels) | Yes | Coordinate-aware experiments |
-| 2 | FiLM feature modulation (global and coordinate-conditioned) | Yes (FiLM/classifier params only) | `Ex-2_Architectural Changes/` |
-| 3 | Fixed, hand-designed center-weighting prior applied at inference | No (inference-only) | `Ex-3_moreWeight_to_central_region/` |
-| 4 | **Learned neighborhood-consensus gating on patch logits** | Yes (gate + classifier params) | `Ex-4_filers(1x1_3x3_5x5)/` (this report) |
+| Accuracy | 0.824 | 0.515 → 0.502 | 0.502 → 0.515 |
+| Precision | 0.734 | 0.458 → 0.545 | 0.545 → 0.577 |
+| Recall | 0.810 | 0.107 → 0.299 | 0.299 → 0.397 |
+| F1 Score | 0.749 | 0.161 → 0.286 | 0.286 → 0.334 |
+| ROC AUC | 0.876 | 0.634 → 0.650 | 0.650 → 0.647 |
+| mIoU (positive) | 0.107 | 0.102 → 0.092 | 0.092 → 0.098 |
 
-Where Experiment 3 injected a fixed, hand-designed spatial prior with no learning involved, Experiment 4 replaces that with a fully learned, data-driven spatial-consistency check that is trained jointly with the rest of the network — representing the most integrated attempt so far at teaching MedicalPatchNet to reason about *where* its patch predictions agree or disagree with each other.
+Recall and F1 continued improving with more training data, but the gap to baseline remained large throughout.
+
+### 5.6 Discussion and Conclusion
+
+Appending raw coordinate channels **did not improve** MedicalPatchNet. Global spatial context was available in principle, but the model could not integrate it effectively with local visual features — classification stayed consistently below baseline and localization changed only marginally. The gradual recall improvement across patient batches suggests the *idea* of spatial context might still be valuable, but **direct channel concatenation is the wrong fusion mechanism.** This finding directly motivated Experiment 2's shift to FiLM-based modulation as an alternative fusion strategy.
 
 ---
 
-## 16. Usage Guide
+## 6. Experiment 2 — Architectural Changes (FiLM, Coordinate-FiLM, Mini-Classifiers)
 
-### 16.1 Instantiating Each Variant
+**Folder:** `Ex-2_Architectural Changes/`
+
+### 6.1 Objective
+
+Following Experiment 1's conclusion that raw coordinate concatenation doesn't work, Experiment 2 tests **Feature-wise Linear Modulation (FiLM)** as a more structured way to inject conditioning signal (global or spatial) into the pretrained backbone's features, without disturbing those pretrained features. It also tests classifier-head depth independently.
+
+Planned research stages for this line of work:
+1. Baseline MedicalPatchNet evaluation
+2. Static FiLM feature modulation
+3. Coordinate-conditioned FiLM
+4. Coordinate representation study
+5. Enhanced patch classifier
+6. Residual calibration network
+7. Learnable patch weighting network
+8. Aggregation strategy comparison
+9. Integration of best-performing modules
+10. Comprehensive ablation study
+
+### 6.2 Phase-1 Version 1 (V1) — Static FiLM, Backbone + Classifier Frozen
+
+A FiLM layer applies a learned, **global** (non-spatial) affine transform to the 1280-dim feature vector produced by the backbone, before the classifier:
 
 ```python
-# Variant A — default3x3
-from default3x3.NetworkModel import getModelClass
-ModelA = getModelClass("ScalePatchNet_filter")(patchSize=64, outFeatures=14)
+self.film_gamma = nn.Parameter(torch.ones(1280))    # init: γ = 1
+self.film_beta  = nn.Parameter(torch.zeros(1280))   # init: β = 0
+...
+feats = self.film_gamma * feats + self.film_beta    # FiLM modulation
+logits = self.classifier(feats)
+```
 
-# Variant B — mini-classifier head
-from default_filter_with_miniclassifiers.NetworkModel import getModelClass
-ModelB = getModelClass("ScalePatchNet_filter")(patchSize=64, outFeatures=14)
+Both the EfficientNetV2-S backbone and the classifier head are frozen; **only `film_gamma` and `film_beta` are trained.** The classifier weights are transferred directly from a pretrained `ScalePatchNet` checkpoint via `from_scalepatchnet_checkpoint()`.
 
-# Variant C — residual double-gate (best-performing)
+**Result:** Preserved the original model's behavior almost perfectly, with mean AUROC improving slightly:
+
+| Model | Mean AUROC |
+|---|---|
+| Baseline | 0.64097 |
+| Phase-1 V1 | 0.64249 (Δ = +0.00152) |
+
+Largest per-disease AUROC gains: Pleural Other (+0.0076), Fracture (+0.0050), Pneumonia (+0.0037), Edema (+0.0036), Pleural Effusion (+0.0033). Most other classes were essentially unchanged.
+
+**Win-count analysis** (number of the 14 diseases each model led on by AUROC):
+
+| Model | Number of Wins |
+|---|---|
+| Baseline | 2 |
+| Phase-1 V1 | 6 |
+| Phase-1 V2 | 4 |
+| Tie | 1 (of 14 total) |
+
+**Conclusion: Phase-1 V1 is safe — it preserves the original model's behavior while producing small, consistent AUROC gains, and was chosen as the foundation for later coordinate-conditioning and spatial-embedding experiments.**
+
+### 6.3 Phase-1 Version 2 (V2) — FiLM + Trainable Classifier, Backbone Frozen
+
+Same FiLM layer, but the classifier head is retrained jointly rather than reused from checkpoint.
+
+**Result:** Larger, more aggressive shifts in decision boundaries. Gains on some diseases came paired with losses on others:
+
+| Disease | AUROC Change |
+|---|---|
+| Consolidation | +0.067 |
+| Pneumonia | +0.052 |
+| No Finding | +0.022 |
+| Fracture | −0.115 |
+| Pleural Other | −0.096 |
+| Lung Lesion | −0.083 |
+| Edema | −0.053 |
+| Enlarged Cardiomediastinum | −0.040 |
+
+**Conclusion:** Retraining the classifier alongside FiLM trades robustness for specialization — it improves specific diseases (Pneumonia, Consolidation) at the cost of others, and won fewer disease-level comparisons overall (4/14) than V1 (6/14).
+
+**Overall Phase-1 ranking:** 1. Phase-1 V1, 2. Baseline, 3. Phase-1 V2.
+
+### 6.4 Coordinate-Conditioned FiLM (`CoordFiLMPatchNet`)
+
+Extends the static FiLM idea to be **spatially aware**: instead of a single global `(γ, β)` pair, a small MLP maps each patch's normalized `(x, y)` grid coordinate to a *per-patch* `(γ, β)` pair.
+
+```python
+self.coord_mlp = nn.Sequential(
+    nn.Linear(2, coord_hidden_dim),
+    nn.ReLU(inplace=True),
+    nn.Linear(coord_hidden_dim, 2 * 1280)   # → split into per-patch γ, β
+)
+```
+
+The last MLP layer is initialized near-identity (`weight *= 0.01`, `bias = 0`) so training starts close to the unmodulated baseline. Two variants exist:
+
+- **`CoordFiLMPatchNet`** — backbone frozen (`eff_features`/`eff_avgpool.eval()`, `requires_grad=False`); only `coord_mlp` and the classifier train.
+- **`CoordFiLMPatchNetUnfrozen`** — identical coordinate-MLP design, but the backbone is fully trainable alongside it.
+
+Both support `from_scalepatchnet_checkpoint()` to initialize backbone + classifier weights from a pretrained `ScalePatchNet`, leaving `coord_mlp` freshly initialized. This is framed as a more structured alternative to Experiment 1's raw coordinate-channel concatenation, since the coordinate signal here only ever rescales/shifts existing backbone features rather than being fed through the convolutional stack as new pixel content.
+
+### 6.5 Multiple Mini-Classifiers (`ScalePatchNet_MiniMiniClassifier`)
+
+Replaces the single `Linear(1280, 14)` head with a deeper cascade:
+
+```python
+self.baseBackbone.classifier = nn.Sequential(
+    nn.Dropout(p=0.2),
+    nn.Linear(1280, 512), nn.ReLU(inplace=True),
+    nn.Linear(512, 256),  nn.ReLU(inplace=True),
+    nn.Linear(256, outFeatures)
+)
+```
+
+This tests whether a progressively-compressing classifier head (1280 → 512 → 256 → 14) extracts more disease-relevant signal than a single linear layer, independent of any FiLM modulation.
+
+### 6.6 Variant Summary Table
+
+| Variant | Backbone | Classifier | Modulation | Result |
+|---|---|---|---|---|
+| Baseline (`ScalePatchNet`) | frozen (pretrained) | linear head | none | Reference; wins 2/14 disease comparisons |
+| FiLM V1 | frozen | frozen (reused) | global static FiLM | **Best balance**; ΔAUROC +0.00152; wins 6/14 |
+| FiLM V2 | frozen | trainable | global static FiLM | High variance; wins 4/14 |
+| CoordFiLMPatchNet | frozen | linear head | per-patch coordinate-conditioned FiLM | Structured alternative to raw coord concat (Ex-1) |
+| CoordFiLMPatchNetUnfrozen | trainable | linear head | per-patch coordinate-conditioned FiLM | All parameters jointly trained |
+| Mini-classifier | frozen | 3-layer MLP head | none | Deeper head tested independently of FiLM |
+
+---
+
+## 7. Experiment 3 — Spatial Prior Patch Weighting
+
+**Folder:** `Ex-3_moreWeight_to_central_region/`
+
+### 7.1 Motivation
+
+MedicalPatchNet averages patch predictions **equally**, but chest abnormalities are not evenly distributed across the image — the lungs, heart, and mediastinum occupy distinct central regions, while image borders contribute little diagnostic information.
+
+### 7.2 Hypothesis
+
+Most diagnostically relevant anatomy sits near the center of a chest radiograph. Upweighting central patches and downweighting peripheral ones might improve localization and prediction confidence — **without needing to retrain anything.**
+
+### 7.3 Methodology
+
+Unlike Experiment 1's retraining approach, this modification is applied **entirely at inference time**; the backbone is left completely untouched.
+
+1. Generate a soft weight map for the input image.
+2. Assign larger weights to central image regions.
+3. Convert the image-level weight map into patch-level weights.
+4. Multiply each patch prediction by its corresponding weight.
+5. Aggregate weighted patch logits to obtain the final prediction.
+
+The weight map combines three components — image intensity, local contrast, and distance from the image center:
+
+\[ W = 0.55I + 0.25C + 0.20P \]
+
+where \(I\) is normalized image intensity, \(C\) is local contrast, and \(P\) is the center-prior map. Patch weights are computed by averaging all pixel weights within each patch (implemented in `patchWeighting.py`).
+
+### 7.4 Experimental Setup
+
+Ran on a subset of 50 test images, no parameter updates. The same pretrained MedicalPatchNet was evaluated under two conditions: raw (unweighted) patch aggregation and weighted patch aggregation, using `evalClassification.py` and `figureGeneration.py` for visualization.
+
+### 7.5 Results
+
+| Task | Prob (Raw) | Prob (Weighted) | IoU (Raw) | IoU (Weighted) |
+|---|---|---|---|---|
+| Airspace Opacity | 0.6665 | 0.6652 | 0.0606 | 0.0607 |
+| Atelectasis | 0.5298 | 0.5284 | 0.0337 | 0.0336 |
+| Cardiomegaly | 0.4688 | 0.4770 | 0.0587 | 0.0585 |
+| Consolidation | 0.3555 | 0.3664 | 0.0000 | 0.0000 |
+| Edema | 0.1242 | 0.1239 | 0.0000 | 0.0000 |
+| Enlarged Cardiomediastinum | 0.5926 | 0.5965 | 0.1045 | 0.1052 |
+| Lung Lesion | 0.1802 | 0.1899 | 0.0028 | 0.0034 |
+| Pleural Effusion | 0.2807 | 0.2814 | 0.0092 | 0.0091 |
+| Pneumothorax | 0.1800 | 0.1838 | 0.0000 | 0.0000 |
+| Support Devices | 0.7135 | 0.7067 | 0.0488 | 0.0486 |
+
+Changes in both classification confidence and localization were **marginal** — for most diseases, weighted and unweighted predictions were essentially identical.
+
+### 7.6 Discussion
+
+The weighting approach successfully injected spatial priors into inference without touching the network or retraining, but the **center-prior assumption produced no meaningful improvement**. The core problem: disease locations vary substantially by condition. Cardiomegaly sits near the cardiac silhouette (central), but pleural effusion, pneumothorax, and lung lesions tend toward the periphery — a single universal center-weighted map risks suppressing exactly the patches that matter most for some conditions.
+
+### 7.7 Conclusion and Future Direction
+
+Patch-level weighting can be grafted onto MedicalPatchNet without retraining, but a generic center prior produced only negligible improvements. The logical next step (not yet implemented) is **disease-specific probability maps** built from CheXlocalize segmentation annotations — rather than a single center prior, each disease would get its own prior derived by aggregating training masks, capturing the most probable anatomical location for that specific pathology.
+
+---
+
+## 8. Experiment 4 — Patch-Consensus Filtering (1x1/3x3/5x5)
+
+**Folder:** `Ex-4_filers(1x1_3x3_5x5)/`
+
+### 8.1 Objective
+
+Introduces a **learned Soft Consensus Gate** that inspects each patch's local neighborhood in logit-space (separately per disease class) and suppresses or boosts patches based on whether their neighbors agree, before mean-aggregation. Suggested by the project guide as a way to reject spatially-isolated outlier patches (e.g., imaging artifacts, rib overlap) that would otherwise skew the global average.
+
+### 8.2 Consensus Gate Design
+
+```python
+self.consensus_conv = nn.Sequential(
+    nn.Conv2d(14, 14, kernel_size=3, padding=1, groups=14),  # depthwise, per-class
+    nn.Conv2d(14, 14, kernel_size=1),                         # pointwise recalibration
+    nn.Sigmoid()
+)
+
+def applyConsensusGate(self, patch_logits):
+    B, P, C = patch_logits.shape
+    grid = int(P ** 0.5)
+    gate_input = patch_logits.view(B, grid, grid, C).permute(0, 3, 1, 2)  # (B,14,8,8)
+    gate = 2 * self.consensus_conv(gate_input)   # rescale sigmoid output to (0,2)
+    gate = gate.permute(0, 2, 3, 1).reshape(B, grid * grid, C)
+    return patch_logits * gate
+
+def forward(self, x):
+    patch_logits = self.forwardRawPatches(x)
+    patch_logits = self.applyConsensusGate(patch_logits)
+    return torch.mean(patch_logits, dim=1)
+```
+
+The depthwise convolution (`groups=14`) ensures each disease's spatial-agreement computation is independent — the gate for "Cardiomegaly" never mixes with the gate for "Pneumothorax," preserving per-disease interpretability.
+
+### 8.3 Three Variants Tested
+
+| Folder | Classifier Head | Gate Formula | Result |
+|---|---|---|---|
+| `default3x3/` | `Linear(1280, 14)` | `logits * gate`, single 3x3 pass, gate ∈ (0,2) | Good, stable metrics — solid baseline |
+| `default_filter_with_miniclassifiers/` | 3-layer MLP (1280→512→256→14) | `logits * gate`, single 3x3 pass | Weaker metrics than the linear-head baseline |
+| `implemented 3x3 filter twice.../` | `Linear(1280, 14)` | `logits * (1 + gate)`, residual, gate computed twice per forward | **Best result** — high precision, F1, sensitivity, specificity |
+
+### 8.4 Why the "Filter Twice" Variant Wins
+
+The winning variant uses `logits * (1 + gate)` instead of `logits * gate`. With `gate` bounded to `(0, 2)`, this makes the effective multiplier `(1, 3)` — meaning it can only ever **preserve or boost** a patch's logit, never suppress it below its original value, unlike the plain multiplicative form (multiplier range `(0, 2)`, which can zero out a patch entirely). This residual-style formulation behaves like an easier optimization target (similar in spirit to ResNet skip connections): the network only has to learn a *correction* on top of a working baseline rather than a scale factor from scratch, which appears to make training more stable.
+
+### 8.5 Filter-Size Sweep Context
+
+The folder name `(1x1_3x3_5x5)` reflects that `kernel_size` in `consensus_conv` is a one-line configurable variable, intended to be swept across 1, 3, and 5. All three variants documented above specifically used `kernel_size = 3`; the single 3x3 filter (applied via the residual/double-call pattern) outperformed both the deeper-classifier combination and (per the experiment log) the alternative default multi-scale filter-bank attempts.
+
+### 8.6 Complexity
+
+The consensus gate is extremely cheap relative to the ~20.2M-parameter EfficientNetV2-S backbone:
+
+| Component | Parameters (kernel_size=3) |
+|---|---|
+| Depthwise conv (14 channels, 3x3, groups=14) | 140 |
+| Pointwise conv (14→14, 1x1) | 210 |
+| **Total gate parameters** | **350** (~0.002% of backbone) |
+
+---
+
+## 9. Cross-Experiment Comparison
+
+| Experiment | Mechanism | Trained end-to-end? | Retraining required? | Outcome |
+|---|---|---|---|---|
+| Ex-1: Coordinate channels | Raw (x,y) grids concatenated as extra input channels | Yes | Yes | **Failed** — hurt classification and localization vs. baseline |
+| Ex-2: FiLM (V1) | Global learnable feature-wise affine modulation, frozen backbone+classifier | Partial (FiLM params only) | Minimal | **Succeeded** — small consistent AUROC gains, safest change |
+| Ex-2: FiLM (V2) | Same FiLM + trainable classifier | Partial | Yes (classifier) | Mixed — gains on some diseases, losses on others |
+| Ex-2: Coordinate-FiLM | Per-patch (x,y)-conditioned FiLM via small MLP | Partial or full | Partial | Proposed structured fix for Ex-1's failure mode |
+| Ex-3: Center-weighting | Fixed, hand-designed spatial prior, inference-only | No | No | **Negligible effect** — center prior too generic across diseases |
+| Ex-4: Consensus gating | Learned depthwise-conv neighborhood agreement gate on patch logits | Yes (gate + classifier) | Yes | **Best result** — especially the residual "filter twice" formulation |
+
+### Progression of Spatial-Awareness Strategies
+
+1. **Ex-1** — inject spatial info as raw input signal (failed: model couldn't integrate it with visual features).
+2. **Ex-2** — inject spatial/global info as a *feature-space* modulation instead of raw input (safer; small gains).
+3. **Ex-3** — inject spatial info as a fixed, hand-designed *output-space* prior with no learning (safe but ineffective; too generic).
+4. **Ex-4** — inject spatial info as a *learned, trained* output-space consistency check (best measured outcome).
+
+The general lesson across all four experiments: **how** spatial or contextual information is fused into the network matters far more than **whether** it is included at all. Naively concatenating or hand-crafting spatial signal (Ex-1, Ex-3) underperforms structured, learned modulation or gating mechanisms (Ex-2 V1, Ex-4) that are designed to leave the pretrained backbone's feature space intact.
+
+---
+
+## 10. Overall Findings
+
+- Raw coordinate-channel concatenation is the wrong way to inject spatial context into MedicalPatchNet — it actively hurts both classification and localization.
+- FiLM modulation with a frozen backbone and reused classifier (Ex-2 V1) is the safest and most reliable architectural change tested, and was adopted as the foundation for further spatial-conditioning work.
+- Retraining the classifier head alongside FiLM increases variance across diseases rather than delivering a clean net improvement.
+- A fixed, hand-designed center-weighting prior (Ex-3) is easy to apply (no retraining) but too generic — different diseases occupy very different anatomical regions.
+- A learned, trained neighborhood-consensus gate (Ex-4) is the strongest intervention tested, and its **residual gating formulation** (`logits * (1 + gate)`) clearly outperforms the plain multiplicative form (`logits * gate`).
+- Deeper mini-classifier heads, tested independently in both Ex-2 and Ex-4, consistently underperformed a single linear classifier layer in this codebase — added classifier capacity was not the bottleneck in any experiment.
+
+---
+
+## 11. Setup and Installation
+
+```bash
+git clone https://github.com/ArvendraChhonkar/Modified_MedicalPatchNet.git
+cd Modified_MedicalPatchNet/Original_Medical_PatchNet
+
+conda env create -f environment.yml
+conda activate <env-name-from-yml>
+```
+
+Datasets required:
+- **CheXpert** — download from the official Stanford ML Group release.
+- **CheXlocalize** — download separately for localization/IoU evaluation; used alongside CheXpert in `preprocessing/`.
+
+---
+
+## 12. Usage
+
+### 12.1 Baseline Training/Evaluation
+
+```bash
+cd Original_Medical_PatchNet
+bash runTraining.sh
+bash runEval.sh
+```
+
+### 12.2 Running a Specific Experiment
+
+Each experiment folder is self-contained with its own `NetworkModel.py` (or equivalently named file) and, where applicable, its own training/eval scripts:
+
+```python
+# Example: Experiment 2, static FiLM (V1)
+from NetworkModel import FiLMPatchNet
+
+model = FiLMPatchNet.from_scalepatchnet_checkpoint(
+    checkpoint_path="Original_Medical_PatchNet/savedModels/<checkpoint>.pt",
+    patchSize=64,
+    outFeatures=14,
+)
+logits = model(x)   # x: (B, 1, 512, 512) grayscale batch
+```
+
+```python
+# Example: Experiment 4, best-performing consensus-gated model
 from importlib import import_module
-module_c = import_module(
+mod = import_module(
+    "Ex-4_filers(1x1_3x3_5x5)."
     "implemented 3x3 filter twice - really high perecision f1 specificity and senesitivity.NetworkModel"
 )
-ModelC = module_c.getModelClass("ScalePatchNet_1x1")(patchSize=64, outFeatures=14)
+model = mod.getModelClass("ScalePatchNet_1x1")(patchSize=64, outFeatures=14)
 ```
 
-> Note: Variant C's folder name contains spaces and cannot be imported with a plain `import` statement — use `importlib.import_module` with the literal folder name, or rename the folder to a valid Python identifier (e.g. `filter_double_gate/`) for cleaner imports.
-
-### 16.2 Forward Pass
-
-```python
-import torch
-
-x = torch.randn(4, 1, 512, 512)   # batch of 4 grayscale chest X-rays
-
-global_logits = ModelA(x)                       # (4, 14) — final disease logits
-raw_patch_logits = ModelA.forwardRawPatches(x)   # (4, 64, 14) — pre-gate, per-patch logits
-gated = ModelA.applyConsensusGate(raw_patch_logits)  # (4, 64, 14) — post-gate logits
-heatmap_ready = ModelA.forwardScaledPatches(x)   # (4, 64, 14) — gated + globally sigmoid-scaled
-```
-
-### 16.3 Changing the Filter Size
-
-Inside any variant's `__init__`, edit the single line:
-
-```python
-kernel_size = 3   # change to 1 or 5 to reproduce the other members of the (1x1_3x3_5x5) sweep
-```
-
-and ensure `padding=(kernel_size - 1) // 2` is left as-is so the spatial grid dimensions (8x8) are preserved after the depthwise convolution.
-
-### 16.4 Visualizing the Gate
-
-```python
-with torch.no_grad():
-    raw = ModelA.forwardRawPatches(x)
-    B, P, C = raw.shape
-    grid = int(P ** 0.5)
-    gate_input = raw.view(B, grid, grid, C).permute(0, 3, 1, 2)
-    gate = 2 * ModelA.consensus_conv(gate_input)   # (B, 14, 8, 8)
-    # gate[:, disease_index] can now be plotted as an 8x8 heatmap per image
-```
+> Note: folder names containing spaces (as in Experiment 4's best variant) cannot be imported with a plain `import` statement — use `importlib.import_module` with the literal path, or rename the folder to a valid identifier.
 
 ---
 
-## 17. Future Work
+## 13. Future Work
 
-- Replace the fixed `2 *` rescale constant with a learnable scalar (or per-class learnable scalar) so the network can learn the optimal boost/suppress range itself rather than having it hardcoded to `(0, 2)`.
-- Combine the residual consensus gate (Variant C) with Phase-1 V1 FiLM modulation from the architectural-change experiments — both are lightweight, backbone-preserving modifications, and their effects may be complementary rather than redundant.
-- Extend the gate to condition on the classifier's confidence (e.g., only gate patches whose absolute logit magnitude exceeds a threshold), so low-confidence patches near the decision boundary are not unnecessarily amplified or suppressed by neighborhood noise.
-- Train a disease-specific gate rescaling factor instead of the shared `2 *` constant across all 14 classes, since different pathologies have different expected spatial extents (e.g., cardiomegaly spans a large central region; a pneumothorax may be a thin peripheral line).
+- Combine Ex-2's Phase-1 V1 FiLM with Ex-4's residual consensus gate — both are lightweight, backbone-preserving modifications, and their effects may be complementary.
+- Replace Ex-3's generic center-weighting prior with disease-specific probability maps derived from CheXlocalize segmentation masks (per-pathology, rather than one-size-fits-all).
+- Complete the remaining planned Ex-2 stages: residual calibration network, learnable patch weighting network, aggregation strategy comparison, and full ablation study.
+- Fix known implementation issues in Experiment 4 (missing `return` in `forwardScaledPatches` for the "filter twice" variant; redundant duplicate gate computation) before further benchmarking.
+- Run a controlled kernel-size sweep (1x1 vs. 3x3 vs. 5x5) in Experiment 4 with the gating formula held fixed, to separate the effect of receptive field from the multiplicative-vs-residual gating change.
 
 ---
 
-## 18. Citation
+## 14. Citation
 
-If you use or build on this experiment, please cite:
+If you use or build on this repository, please cite:
 
-Chhonkar, A. (2026). *Research and Development of Explainable Deep Learning Models for Chest X-Ray Classification and Localization using MedicalPatchNet.* IIT (BHU) Internship Report — Experiment 4: Patch-Consensus Filtering (1x1/3x3/5x5).
+Chhonkar, A. (2026). *Research and Development of Explainable Deep Learning Models for Chest X-Ray Classification and Localization using MedicalPatchNet.* IIT (BHU) Internship Report.
+
+---
+
+## 15. License
+
+Released under the MIT License. See [LICENSE](./LICENSE) for details.
